@@ -20,7 +20,7 @@ import (
 
 // ─── Version ────────────────────────────────────────────────────────────────
 
-const version = "1.2.0"
+const version = "1.2.1"
 const baseURL = "https://api.mymind.com"
 
 // ─── Credential Loading ───────────────────────────────────────────────────────
@@ -541,6 +541,14 @@ func (c *MyMindClient) RemoveFromSpace(spaceID, objectID string) (map[string]int
 	return c.request("DELETE", "/spaces/"+spaceID+"/objects/"+objectID, nil, nil)
 }
 
+func (c *MyMindClient) AddToSpaceByObject(objectID string, spaceIDs []string) (map[string]interface{}, error) {
+	body := make([]map[string]string, len(spaceIDs))
+	for i, sid := range spaceIDs {
+		body[i] = map[string]string{"id": sid}
+	}
+	return c.request("POST", "/objects/"+objectID+"/spaces", body, nil)
+}
+
 // ─── Tags ────────────────────────────────────────────────────────────────────
 
 func (c *MyMindClient) AddTags(id string, tags []string) (map[string]interface{}, error) {
@@ -730,6 +738,9 @@ var tools = map[string]toolHandler{
 	"remove_object_from_space": func(c *MyMindClient, args map[string]interface{}) (interface{}, error) {
 		return c.RemoveFromSpace(getString(args, "spaceId"), getString(args, "objectId"))
 	},
+	"add_object_to_space_by_object": func(c *MyMindClient, args map[string]interface{}) (interface{}, error) {
+		return c.AddToSpaceByObject(getString(args, "objectId"), toStringArray(args["spaceIds"]))
+	},
 
 	// Tags
 	"add_tags": func(c *MyMindClient, args map[string]interface{}) (interface{}, error) {
@@ -867,6 +878,7 @@ var toolManifest = []map[string]interface{}{
 	// Space membership
 	{"name": "add_object_to_space", "description": "Add an object to a space. Idempotent.", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"spaceId": map[string]interface{}{"type": "string"}, "objectId": map[string]interface{}{"type": "string"}}, "required": []interface{}{"spaceId", "objectId"}}},
 	{"name": "remove_object_from_space", "description": "Remove an object from a space. Idempotent.", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"spaceId": map[string]interface{}{"type": "string"}, "objectId": map[string]interface{}{"type": "string"}}, "required": []interface{}{"spaceId", "objectId"}}},
+	{"name": "add_object_to_space_by_object", "description": "Add an object to one or more spaces. Params: objectId, spaceIds (array of space ID strings).", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"objectId": map[string]interface{}{"type": "string"}, "spaceIds": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}}}, "required": []interface{}{"objectId", "spaceIds"}}},
 
 	// Tags
 	{"name": "add_tags", "description": "Add tags to an object. Params: id, tags (array of strings).", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"id": map[string]interface{}{"type": "string"}, "tags": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}}}, "required": []interface{}{"id", "tags"}}},
