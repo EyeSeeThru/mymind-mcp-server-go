@@ -2,11 +2,10 @@
 package jwt
 
 import (
-	"crypto/base64"
+	"encoding/base64"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/json"
-	"fmt"
 	"strings"
 	"time"
 )
