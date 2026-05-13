@@ -1,3 +1,3 @@
-module github.com/your-username/mymind-mcp-server-go
+module github.com/EyeSeeThru/mymind-mcp-server-go
 
 go 1.21
