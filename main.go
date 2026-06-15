@@ -20,7 +20,7 @@ import (
 
 // ─── Version ────────────────────────────────────────────────────────────────
 
-const version = "1.2.1"
+const version = "1.3.0"
 const baseURL = "https://api.mymind.com"
 
 // ─── Credential Loading ───────────────────────────────────────────────────────
@@ -167,9 +167,49 @@ func (c *MyMindClient) requestRaw(method, path string, headers map[string]string
 	return raw, contentType, nil
 }
 
+// requestRawArray is like request() but preserves top-level JSON arrays.
+// MyMind /objects returns a top-level array; request() unmarshals into a map and silently drops it.
+func (c *MyMindClient) requestRawArray(method, path string, params map[string]string) (interface{}, error) {
+	reqURL := c.baseURL + path
+	if len(params) > 0 {
+		q := url.Values{}
+		for k, v := range params {
+			q.Set(k, v)
+		}
+		reqURL += "?" + q.Encode()
+	}
+	req, err := http.NewRequest(method, reqURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	token := jwt.Sign(c.kid, c.secret, path, method)
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("User-Agent", "mymind-mcp-server-go/"+version)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("network error: %w", err)
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode >= 400 {
+		var errBody map[string]interface{}
+		_ = json.Unmarshal(raw, &errBody)
+		return nil, fmt.Errorf("MyMind API error %d: %v", resp.StatusCode, errBody)
+	}
+	if len(raw) == 0 {
+		return nil, nil
+	}
+	var out interface{}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return nil, fmt.Errorf("decode response: %w", err)
+	}
+	return out, nil
+}
+
 // ─── Objects ────────────────────────────────────────────────────────────────
 
-func (c *MyMindClient) ListObjects(q string, limit int, contentAs string, similarTo string) ([]interface{}, error) {
+func (c *MyMindClient) ListObjects(q string, limit int, contentAs string, similarTo string, include string, spaceID string) ([]interface{}, error) {
 	params := map[string]string{"limit": fmt.Sprintf("%d", limit)}
 	if q != "" {
 		params["q"] = q
@@ -177,20 +217,33 @@ func (c *MyMindClient) ListObjects(q string, limit int, contentAs string, simila
 	if similarTo != "" {
 		params["similarTo"] = similarTo
 	}
-	resp, err := c.request("GET", "/objects", nil, params)
+	if include != "" {
+		params["include"] = include
+	}
+	if spaceID != "" {
+		params["spaceId"] = spaceID
+	}
+	// The MyMind API returns a top-level JSON array for /objects; request()
+	// unmarshals into a map and silently drops arrays. Call directly here.
+	raw, err := c.requestRawArray("GET", "/objects", params)
 	if err != nil {
 		return nil, err
 	}
-	if resp == nil {
-		return []interface{}{}, nil
-	}
-	if arr, ok := resp["data"].([]interface{}); ok {
+	if arr, ok := raw.([]interface{}); ok {
 		return arr, nil
+	}
+	if m, ok := raw.(map[string]interface{}); ok {
+		if arr, ok := m["data"].([]interface{}); ok {
+			return arr, nil
+		}
+		if arr, ok := m["matches"].([]interface{}); ok {
+			return arr, nil
+		}
 	}
 	return []interface{}{}, nil
 }
 
-func (c *MyMindClient) CreateObject(title, content, objURL string, tags, spaces []string) (map[string]interface{}, error) {
+func (c *MyMindClient) CreateObject(title, content, objURL string, tags, spaces []string, notes []map[string]interface{}) (map[string]interface{}, error) {
 	body := map[string]interface{}{}
 	if title != "" {
 		body["title"] = title
@@ -215,24 +268,34 @@ func (c *MyMindClient) CreateObject(title, content, objURL string, tags, spaces 
 		}
 		body["spaces"] = spaceObjs
 	}
+	if len(notes) > 0 {
+		// v0.7.0: attach notes at creation. Accepts []map; pass through as-is.
+		body["notes"] = notes
+	}
 	return c.request("POST", "/objects", body, nil)
 }
 
-func (c *MyMindClient) GetObject(id, contentAs string) (map[string]interface{}, error) {
+func (c *MyMindClient) GetObject(id, contentAs string, include string) (map[string]interface{}, error) {
 	params := map[string]string{}
 	if contentAs != "" {
 		params["contentAs"] = contentAs
 	}
+	if include != "" {
+		params["include"] = include
+	}
 	return c.request("GET", "/objects/"+id, nil, params)
 }
 
-func (c *MyMindClient) UpdateObject(id, title, summary string) (map[string]interface{}, error) {
+func (c *MyMindClient) UpdateObject(id, title, summary string, completed *bool) (map[string]interface{}, error) {
 	body := map[string]interface{}{}
 	if title != "" {
 		body["title"] = title
 	}
 	if summary != "" {
 		body["summary"] = summary
+	}
+	if completed != nil {
+		body["completed"] = *completed
 	}
 	return c.request("PATCH", "/objects/"+id, body, nil)
 }
@@ -302,12 +365,16 @@ func (c *MyMindClient) Search(query string, limit int, semantic bool, semanticBo
 		params["rerank"] = "true"
 		params["semantic"] = "true"
 	}
+	// /search returns {"matches":[...]} per the API docs.
 	resp, err := c.request("GET", "/search", nil, params)
 	if err != nil {
 		return nil, err
 	}
 	if resp == nil {
 		return []interface{}{}, nil
+	}
+	if arr, ok := resp["matches"].([]interface{}); ok {
+		return arr, nil
 	}
 	if arr, ok := resp["data"].([]interface{}); ok {
 		return arr, nil
@@ -506,15 +573,21 @@ func (c *MyMindClient) DeleteNote(objectID, noteID string) (map[string]interface
 // ─── Links ──────────────────────────────────────────────────────────────────
 
 func (c *MyMindClient) ListLinks() ([]interface{}, error) {
-	resp, err := c.request("GET", "/links", nil, nil)
+	// /links returns a top-level JSON array; use requestRawArray.
+	raw, err := c.requestRawArray("GET", "/links", nil)
 	if err != nil {
 		return nil, err
 	}
-	if resp == nil {
-		return []interface{}{}, nil
-	}
-	if arr, ok := resp["data"].([]interface{}); ok {
+	if arr, ok := raw.([]interface{}); ok {
 		return arr, nil
+	}
+	if m, ok := raw.(map[string]interface{}); ok {
+		if arr, ok := m["data"].([]interface{}); ok {
+			return arr, nil
+		}
+		if arr, ok := m["matches"].([]interface{}); ok {
+			return arr, nil
+		}
 	}
 	return []interface{}{}, nil
 }
@@ -565,15 +638,21 @@ func (c *MyMindClient) RemoveTags(id string, tags []map[string]string) (map[stri
 
 func (c *MyMindClient) ListTags(limit int) ([]interface{}, error) {
 	params := map[string]string{"limit": fmt.Sprintf("%d", limit)}
-	resp, err := c.request("GET", "/tags", nil, params)
+	// /tags returns a top-level JSON array; use requestRawArray.
+	raw, err := c.requestRawArray("GET", "/tags", params)
 	if err != nil {
 		return nil, err
 	}
-	if resp == nil {
-		return []interface{}{}, nil
-	}
-	if arr, ok := resp["data"].([]interface{}); ok {
+	if arr, ok := raw.([]interface{}); ok {
 		return arr, nil
+	}
+	if m, ok := raw.(map[string]interface{}); ok {
+		if arr, ok := m["data"].([]interface{}); ok {
+			return arr, nil
+		}
+		if arr, ok := m["matches"].([]interface{}); ok {
+			return arr, nil
+		}
 	}
 	return []interface{}{}, nil
 }
@@ -581,23 +660,37 @@ func (c *MyMindClient) ListTags(limit int) ([]interface{}, error) {
 // ─── Spaces ─────────────────────────────────────────────────────────────────
 
 func (c *MyMindClient) ListSpaces() ([]interface{}, error) {
-	resp, err := c.request("GET", "/spaces", nil, nil)
+	// /spaces returns a top-level JSON array; use requestRawArray.
+	raw, err := c.requestRawArray("GET", "/spaces", nil)
 	if err != nil {
 		return nil, err
 	}
-	if resp == nil {
-		return []interface{}{}, nil
-	}
-	if arr, ok := resp["data"].([]interface{}); ok {
+	if arr, ok := raw.([]interface{}); ok {
 		return arr, nil
+	}
+	if m, ok := raw.(map[string]interface{}); ok {
+		if arr, ok := m["data"].([]interface{}); ok {
+			return arr, nil
+		}
+		if arr, ok := m["matches"].([]interface{}); ok {
+			return arr, nil
+		}
 	}
 	return []interface{}{}, nil
 }
 
-func (c *MyMindClient) CreateSpace(name string, color string) (map[string]interface{}, error) {
+func (c *MyMindClient) CreateSpace(name string, color string, objectIDs []string) (map[string]interface{}, error) {
 	body := map[string]interface{}{"name": name}
 	if color != "" {
 		body["color"] = color
+	}
+	if len(objectIDs) > 0 {
+		// v0.7.0: populate space at creation
+		objs := make([]map[string]string, len(objectIDs))
+		for i, oid := range objectIDs {
+			objs[i] = map[string]string{"id": oid}
+		}
+		body["objects"] = objs
 	}
 	return c.request("POST", "/spaces", body, nil)
 }
@@ -629,12 +722,16 @@ func (c *MyMindClient) Related(id string, limit int) ([]interface{}, error) {
 		"semantic":  "true",
 		"limit":     fmt.Sprintf("%d", limit),
 	}
+	// /search returns {"matches":[...]} per the API docs.
 	resp, err := c.request("GET", "/search", nil, params)
 	if err != nil {
 		return nil, err
 	}
 	if resp == nil {
 		return []interface{}{}, nil
+	}
+	if arr, ok := resp["matches"].([]interface{}); ok {
+		return arr, nil
 	}
 	if arr, ok := resp["data"].([]interface{}); ok {
 		return arr, nil
@@ -649,18 +746,20 @@ type toolHandler func(client *MyMindClient, args map[string]interface{}) (interf
 var tools = map[string]toolHandler{
 	// Objects
 	"list_objects": func(c *MyMindClient, args map[string]interface{}) (interface{}, error) {
-		return c.ListObjects(getString(args, "q"), getInt(args, "limit", 100), getString(args, "contentAs"), getString(args, "similarTo"))
+		return c.ListObjects(getString(args, "q"), getInt(args, "limit", 100), getString(args, "contentAs"), getString(args, "similarTo"), getString(args, "include"), getString(args, "spaceId"))
 	},
 	"create_object": func(c *MyMindClient, args map[string]interface{}) (interface{}, error) {
 		tags := toStringArray(args["tags"])
 		spaces := toStringArray(args["spaces"])
-		return c.CreateObject(getString(args, "title"), getString(args, "content"), getString(args, "url"), tags, spaces)
+		notes := toNoteArray(args["notes"])
+		return c.CreateObject(getString(args, "title"), getString(args, "content"), getString(args, "url"), tags, spaces, notes)
 	},
 	"get_object": func(c *MyMindClient, args map[string]interface{}) (interface{}, error) {
-		return c.GetObject(getString(args, "id"), getString(args, "contentAs"))
+		return c.GetObject(getString(args, "id"), getString(args, "contentAs"), getString(args, "include"))
 	},
 	"update_object": func(c *MyMindClient, args map[string]interface{}) (interface{}, error) {
-		return c.UpdateObject(getString(args, "id"), getString(args, "title"), getString(args, "summary"))
+		completed := getBoolPtr(args, "completed")
+		return c.UpdateObject(getString(args, "id"), getString(args, "title"), getString(args, "summary"), completed)
 	},
 	"delete_object": func(c *MyMindClient, args map[string]interface{}) (interface{}, error) {
 		return c.DeleteObject(getString(args, "id"))
@@ -774,7 +873,7 @@ var tools = map[string]toolHandler{
 		return c.ListSpaces()
 	},
 	"create_space": func(c *MyMindClient, args map[string]interface{}) (interface{}, error) {
-		return c.CreateSpace(getString(args, "name"), getString(args, "color"))
+		return c.CreateSpace(getString(args, "name"), getString(args, "color"), toStringArray(args["objectIds"]))
 	},
 	"get_space": func(c *MyMindClient, args map[string]interface{}) (interface{}, error) {
 		return c.GetSpace(getString(args, "id"))
@@ -839,14 +938,53 @@ func toStringArray(v interface{}) []string {
 	return result
 }
 
+// toNoteArray normalizes the "notes" param to a []map[string]interface{} ready for the API.
+// Accepts either [{content: {type, body}}, ...] (passed through) or plain strings (wrapped in text/markdown).
+func toNoteArray(v interface{}) []map[string]interface{} {
+	if v == nil {
+		return nil
+	}
+	arr, ok := v.([]interface{})
+	if !ok {
+		return nil
+	}
+	out := make([]map[string]interface{}, 0, len(arr))
+	for _, item := range arr {
+		switch t := item.(type) {
+		case map[string]interface{}:
+			if _, has := t["content"]; has {
+				out = append(out, t)
+			}
+		case string:
+			out = append(out, map[string]interface{}{
+				"content": map[string]interface{}{"type": "text/markdown", "body": t},
+			})
+		}
+	}
+	return out
+}
+
+// getBoolPtr returns a *bool so the caller can distinguish "not set" from "explicit false".
+func getBoolPtr(args map[string]interface{}, key string) *bool {
+	v, ok := args[key]
+	if !ok {
+		return nil
+	}
+	b, ok := v.(bool)
+	if !ok {
+		return nil
+	}
+	return &b
+}
+
 // ─── MCP Protocol ─────────────────────────────────────────────────────────────
 
 var toolManifest = []map[string]interface{}{
 	// Objects
-	{"name": "list_objects", "description": "List objects from MyMind. Params: q, limit, contentAs, similarTo.", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"q": map[string]interface{}{"type": "string"}, "limit": map[string]interface{}{"type": "integer", "default": 100}, "contentAs": map[string]interface{}{"type": "string"}, "similarTo": map[string]interface{}{"type": "string"}}}},
-	{"name": "create_object", "description": "Create a new object (URL, note, or content) in MyMind.", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"title": map[string]interface{}{"type": "string"}, "content": map[string]interface{}{"type": "string"}, "url": map[string]interface{}{"type": "string"}, "tags": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}}, "spaces": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}}}, "required": []interface{}{}}},
-	{"name": "get_object", "description": "Get a single object by ID. Optional: contentAs.", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"id": map[string]interface{}{"type": "string"}, "contentAs": map[string]interface{}{"type": "string"}}, "required": []interface{}{"id"}}},
-	{"name": "update_object", "description": "Update an object's title or summary.", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"id": map[string]interface{}{"type": "string"}, "title": map[string]interface{}{"type": "string"}, "summary": map[string]interface{}{"type": "string"}}, "required": []interface{}{"id"}}},
+	{"name": "list_objects", "description": "List objects from MyMind. Params: q, limit, contentAs, similarTo, include (e.g. 'embeddings' — adds the embeddings array to each object), spaceId (restrict to one space).", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"q": map[string]interface{}{"type": "string"}, "limit": map[string]interface{}{"type": "integer", "default": 100}, "contentAs": map[string]interface{}{"type": "string"}, "similarTo": map[string]interface{}{"type": "string"}, "include": map[string]interface{}{"type": "string"}, "spaceId": map[string]interface{}{"type": "string"}}}},
+	{"name": "create_object", "description": "Create a new object (URL, note, or content) in MyMind. Optional: tags, spaces, notes (list of {content: {type, body}} attached at creation — v0.7.0).", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"title": map[string]interface{}{"type": "string"}, "content": map[string]interface{}{"type": "string"}, "url": map[string]interface{}{"type": "string"}, "tags": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}}, "spaces": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}}, "notes": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "object"}}}, "required": []interface{}{}}},
+	{"name": "get_object", "description": "Get a single object by ID. Optional: contentAs, include (e.g. 'embeddings' — v0.7.0).", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"id": map[string]interface{}{"type": "string"}, "contentAs": map[string]interface{}{"type": "string"}, "include": map[string]interface{}{"type": "string"}}, "required": []interface{}{"id"}}},
+	{"name": "update_object", "description": "Update an object's title, summary, or completed (boolean — mark done / un-mark — v0.7.0).", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"id": map[string]interface{}{"type": "string"}, "title": map[string]interface{}{"type": "string"}, "summary": map[string]interface{}{"type": "string"}, "completed": map[string]interface{}{"type": "boolean"}}, "required": []interface{}{"id"}}},
 	{"name": "delete_object", "description": "Delete an object by ID.", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"id": map[string]interface{}{"type": "string"}}, "required": []interface{}{"id"}}},
 	{"name": "restore_object", "description": "Restore a soft-deleted object within the 30-day recovery window.", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"id": map[string]interface{}{"type": "string"}}, "required": []interface{}{"id"}}},
 	{"name": "download_object", "description": "Download original uploaded bytes (base64). Uses /blob path.", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"id": map[string]interface{}{"type": "string"}}, "required": []interface{}{"id"}}},
@@ -887,7 +1025,7 @@ var toolManifest = []map[string]interface{}{
 
 	// Spaces
 	{"name": "list_spaces", "description": "List all spaces.", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{}}},
-	{"name": "create_space", "description": "Create a new space. Params: name, color (optional CSS color).", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"name": map[string]interface{}{"type": "string"}, "color": map[string]interface{}{"type": "string"}}, "required": []interface{}{"name"}}},
+	{"name": "create_space", "description": "Create a new space. Optional: color (CSS color value), objectIds (list of Uid — populate space at creation — v0.7.0).", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"name": map[string]interface{}{"type": "string"}, "color": map[string]interface{}{"type": "string"}, "objectIds": map[string]interface{}{"type": "array", "items": map[string]interface{}{"type": "string"}}}, "required": []interface{}{"name"}}},
 	{"name": "get_space", "description": "Get a space by ID.", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"id": map[string]interface{}{"type": "string"}}, "required": []interface{}{"id"}}},
 	{"name": "update_space", "description": "Update a space's name or color.", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"id": map[string]interface{}{"type": "string"}, "name": map[string]interface{}{"type": "string"}, "color": map[string]interface{}{"type": "string"}}, "required": []interface{}{"id"}}},
 	{"name": "delete_space", "description": "Delete a space. Objects in the space survive.", "inputSchema": map[string]interface{}{"type": "object", "properties": map[string]interface{}{"id": map[string]interface{}{"type": "string"}}, "required": []interface{}{"id"}}},
